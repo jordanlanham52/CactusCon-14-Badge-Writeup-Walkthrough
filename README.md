@@ -25,9 +25,10 @@
 12. [CactIOT API](#12-cactiot-api)
 13. [NeoPixel LED Control](#13-neopixel-led-control)
 14. [OTA Update System](#14-ota-update-system)
-15. [Modding the Badge](#15-modding-the-badge)
-16. [Easter Eggs & Fun Stuff](#16-easter-eggs--fun-stuff)
-17. [Unsolved Mysteries](#17-unsolved-mysteries)
+15. [Buzzer Mod - Freeing GPIO 19](#15-buzzer-mod---freeing-gpio-19)
+16. [Modding the Badge](#16-modding-the-badge)
+17. [Easter Eggs & Fun Stuff](#17-easter-eggs--fun-stuff)
+18. [Unsolved Mysteries](#18-unsolved-mysteries)
 
 ---
 
@@ -141,6 +142,7 @@ CHAT_ADV_PREFIX    = "CC14PEER"  # BLE advertisement prefix
 
 ```python
 PIN_NEOPIXEL   = 18   # WS2812B data line
+PIN_BUZZER     = 19   # FUET-9032 passive buzzer (blocked by USB OTG in stock firmware)
 NUM_NEOPIXELS  = 6    # LED count
 PIN_STATUS_LED = 21   # Status indicator
 PINS_LED       = [13, 14, 15, 16, 17, 46]  # Additional LEDs
@@ -848,7 +850,179 @@ The headless mode detection means the badge can operate without a display - it w
 
 ---
 
-## 15. Modding the Badge
+## 15. Buzzer Mod - Freeing GPIO 19
+
+### The Problem
+
+The badge has an populated buzzer pad on the PCB connected to GPIO 19. The component is a **FUET-9032-3.6V passive magnetic buzzer** with a 2700Hz resonant frequency, driven low-side. But in stock firmware, GPIO 19 is claimed by the ESP32-S3's native USB OTG peripheral (USB D-), so any attempt to use it throws an error:
+
+```python
+>>> from machine import Pin, PWM
+>>> PWM(Pin(19))
+# ValueError: Pin(19) is used by USB
+```
+
+GPIO 19 = USB D- and GPIO 20 = USB D+ are hardwired to the ESP32-S3's internal USB controller. Even though the badge uses an external CH340 USB-to-serial chip (on UART0, GPIO 43/44) for all serial communication, the firmware still initializes the native USB peripheral at boot, locking both pins.
+
+### The Fix
+
+The fix is rebuilding the firmware with `--enable-cdc-repl=n`, which inserts the following into `mpconfigport.h`:
+
+```c
+#define MICROPY_HW_ENABLE_USBDEV  (0)
+#define MICROPY_HW_USB_CDC  (0)
+#define MICROPY_HW_ESP_USB_SERIAL_JTAG  (0)
+```
+
+This prevents `usb_init()` from being called at boot, freeing GPIO 19 and 20. The UART REPL over the CH340 chip is completely unaffected — that's a separate hardware path.
+
+### Building the Fixed Firmware
+
+The firmware is built from the [CactusCon LVGL MicroPython fork](https://github.com/cactuscon/lvgl_micropython) using Docker:
+
+```dockerfile
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    software-properties-common && \
+    add-apt-repository ppa:git-core/ppa -y && \
+    apt-get update && apt-get install -y \
+    python3 python3-pip python3-venv \
+    git wget curl make gcc g++ flex bison gperf \
+    cmake ninja-build ccache libffi-dev libssl-dev \
+    dfu-util libusb-1.0-0 \
+    python3-serial python3-click python3-cryptography \
+    python3-future python3-pyparsing python3-pyelftools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN git clone --depth=1 --recursive --shallow-submodules \
+    https://github.com/cactuscon/lvgl_micropython.git /workspace
+
+# Fix ESP-IDF lockfile version mismatch (expects 5.4.2, submodule is 5.4.0)
+RUN sed -i 's/version: 5.4.2/version: 5.4.0/' \
+    /workspace/lib/micropython/ports/esp32/lockfiles/dependencies.lock.esp32s3
+
+ENTRYPOINT ["python3", "make.py", "esp32", \
+    "BOARD=ESP32_GENERIC_S3", "--flash-size=16", \
+    "--enable-cdc-repl=n", "--enable-jtag-repl=n", "--enable-uart-repl=y", \
+    "DISPLAY=rgb_display", "DISPLAY=st7796", "DISPLAY=st7789", \
+    "DISPLAY=st7735", "DISPLAY=ili9488", "DISPLAY=ili9486", \
+    "DISPLAY=ili9481", "DISPLAY=ili9341", "DISPLAY=ili9225", \
+    "DISPLAY=ili9163", "DISPLAY=gc9a01", \
+    "INDEV=xpt2046", "INDEV=gt911", "INDEV=ft6x36", \
+    "INDEV=ft6x06", "INDEV=ft5x16", "INDEV=ft5x06", \
+    "MICROPY_HW_ESP_NEW_I2C_DRIVER=1"]
+```
+
+```bash
+# Build the Docker image and run the firmware compilation
+docker build -t cc14-buzzer .
+docker run --name cc14-build cc14-buzzer
+
+# Extract the built firmware
+docker cp cc14-build:/workspace/build/lvgl_micropy_ESP32_GENERIC_S3-16.bin ./firmware_combined.bin
+docker cp cc14-build:/workspace/lib/micropython/ports/esp32/build-ESP32_GENERIC_S3/bootloader/bootloader.bin ./bootloader.bin
+docker cp cc14-build:/workspace/lib/micropython/ports/esp32/build-ESP32_GENERIC_S3/micropython.bin ./micropython.bin
+```
+
+**Critical gotcha**: You MUST use `BOARD=ESP32_GENERIC_S3` with **no** `BOARD_VARIANT`. The badge uses **quad PSRAM** (`quad_psram`). Using `BOARD_VARIANT=SPIRAM_OCT` configures octal PSRAM mode, which causes the badge to hang during boot at "Cleaning up..." because the PSRAM is incorrectly initialized.
+
+### Creating the Full 16MB Image
+
+The Docker build produces only the ~2.8MB firmware (bootloader + partition table + app). To preserve the badge's filesystem (all the game code, sprites, config), you need to merge the new firmware into the original 16MB flash image:
+
+```python
+# merge_firmware.py
+ORIG = 'lvgl_micropy_ESP32_GENERIC_S3-16MB.bin'  # Original 16MB badge image
+BOOT = 'bootloader.bin'                            # Docker-built bootloader
+APP  = 'micropython.bin'                           # Docker-built app
+
+with open(ORIG, 'rb') as f:
+    merged = bytearray(f.read())
+
+with open(BOOT, 'rb') as f:
+    boot = f.read()
+merged[0:len(boot)] = boot                        # Replace bootloader
+
+with open(APP, 'rb') as f:
+    app = f.read()
+APP_START = 0x10000
+APP_END = 0x2D0000
+merged[APP_START:APP_START + len(app)] = app       # Replace app
+merged[APP_START + len(app):APP_END] = b'\xFF' * (APP_END - APP_START - len(app))
+
+with open('cc14_full_16MB_buzzer_fix.bin', 'wb') as f:
+    f.write(merged)
+```
+
+This preserves:
+- Original partition table at `0x8000` (factory app: `0x10000`-`0x2D0000`, ffat: `0x2D0000`-`0x1000000`)
+- NVS data at `0x9000` (WiFi creds, game saves, achievements)
+- The entire FAT filesystem at `0x2D0000` (all `.mpy` game code, sprites, configs)
+
+### Flashing
+
+```bash
+python3 -m esptool --chip esp32s3 -p (PORT) -b 460800 \
+    --before default-reset --after hard-reset \
+    write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m \
+    0x0 cc14_full_16MB_buzzer_fix.bin
+```
+
+### Using the Buzzer
+
+With the fixed firmware, GPIO 19 is free for PWM:
+
+```python
+from machine import Pin, PWM
+import time
+
+buzzer = PWM(Pin(19))
+buzzer.freq(2700)        # Resonant frequency - loudest tone
+buzzer.duty_u16(32768)   # 50% duty cycle
+time.sleep(1)            # Beep for 1 second
+buzzer.duty_u16(0)       # Silence
+buzzer.deinit()          # Release the pin
+```
+
+Play different tones:
+
+```python
+# Simple melody
+def beep(freq, duration_ms):
+    buzzer = PWM(Pin(19))
+    buzzer.freq(freq)
+    buzzer.duty_u16(32768)
+    time.sleep_ms(duration_ms)
+    buzzer.duty_u16(0)
+    buzzer.deinit()
+
+beep(2700, 200)  # High beep
+beep(1800, 200)  # Mid beep
+beep(1200, 400)  # Low beep
+```
+
+### What Changed in the Binary
+
+The fixed firmware is 384 bytes smaller than the original. Comparing the two:
+
+| Check | Result |
+|-------|--------|
+| TinyUSB strings removed | 10 references eliminated |
+| PSRAM driver | `quad_psram` (matches original) |
+| Board config | `ESP32_GENERIC_S3` (matches original) |
+| MicroPython version | 1.26.1 (identical) |
+| IDF version | 67c1de1e-dirty (identical) |
+| LVGL version | 9.4.0 (identical) |
+| Filesystem | Byte-identical to original |
+| UART REPL | Still works at 115200 via CH340 |
+
+---
+
+## 16. Modding the Badge
 
 ### The main.py Trick
 
@@ -884,7 +1058,7 @@ for ns in ['cactuscon', 'write']:
 
 ---
 
-## 16. Easter Eggs & Fun Stuff
+## 17. Easter Eggs & Fun Stuff
 
 **Embedded Splash Screen** - There's a ~570KB JPEG buried in the firmware at `0x40254`. It's the CactusCon boot splash. You can rip it out:
 ```bash
@@ -908,7 +1082,7 @@ dd if=firmware.bin of=splash.jpg bs=1 skip=$((0x40254)) count=$((0xCC9C7 - 0x402
 
 ---
 
-## 17. Unsolved Mysteries
+## 18. Unsolved Mysteries
 
 **The Portability Key** - Whatever string SHA-1 hashes to `f598682777ca9c75daa4b1b2a978d44ae9752035` remains unknown. Bypassed via monkey-patching, but the real key is still out there.
 
